@@ -23,6 +23,8 @@ jobs:
           echo "Commit   : ${{ github.sha }}"
           echo "Author   : ${{ github.actor }}"
           echo "Message  : ${{ github.event.head_commit.message }}"
+          echo "Changed files:"
+          git diff --name-only HEAD~1 HEAD || echo "Initial commit"
 
   build:
     name: "Stage 2 — Build & Compile"
@@ -38,7 +40,7 @@ jobs:
           cache: maven
       - name: Build JAR
         run: mvn clean package -DskipTests -q
-      - name: Upload JAR
+      - name: Upload JAR artifact
         uses: actions/upload-artifact@v4
         with:
           name: payment-jar
@@ -76,7 +78,7 @@ jobs:
           cache: maven
       - name: Dependency vulnerability check
         run: mvn dependency:analyze -q || true
-      - name: Check for secrets
+      - name: Check for hardcoded secrets
         run: |
           echo "Scanning for hardcoded secrets..."
           if grep -r "password\s*=\s*['\"][^$]" src/ --include="*.java" | grep -v "test" | grep -v "//" ; then
@@ -90,11 +92,16 @@ jobs:
     runs-on: ubuntu-latest
     needs: security-scan
     steps:
-      - name: Check backend connectivity
+      - name: Check EC2 backend connectivity
         run: |
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
             http://${{ secrets.EC2_HOST }}/health || echo "000")
           echo "EC2 Gateway status: $STATUS"
+          if [ "$STATUS" = "200" ]; then
+            echo "Backend is reachable"
+          else
+            echo "Backend unreachable - continuing anyway"
+          fi
 
   docker-build:
     name: "Stage 6 — Build Docker Image"
@@ -107,6 +114,8 @@ jobs:
         with:
           name: payment-jar
           path: target/
+      - name: Copy JAR to root for Docker build
+        run: cp target/*.jar app.jar
       - name: Build Docker image
         run: |
           docker build -t mcart-payment-service:${{ github.sha }} .
@@ -141,14 +150,14 @@ jobs:
           script: |
             cd /home/ubuntu/mcart/mcart-payment-service
             mv *.jar app.jar 2>/dev/null || true
-            echo "JAR deployed at $(date)"
+            echo "Payment JAR deployed to EC2 at $(date)"
 
   docker-restart:
     name: "Stage 8 — Docker Build & Restart"
     runs-on: ubuntu-latest
     needs: deploy
     steps:
-      - name: Rebuild container on EC2
+      - name: Rebuild and restart container
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -158,6 +167,7 @@ jobs:
             cd /home/ubuntu/mcart
             docker-compose build payment-service
             docker-compose up -d --no-deps payment-service
+            echo "Payment Service restarted at $(date)"
             docker-compose ps payment-service
 
   smoke-test:
@@ -165,13 +175,18 @@ jobs:
     runs-on: ubuntu-latest
     needs: docker-restart
     steps:
-      - name: Wait for service
+      - name: Wait for service to start
         run: sleep 20
       - name: Health check
         run: |
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
             http://${{ secrets.EC2_HOST }}/api/payments/health || echo "000")
-          echo "Payment Service health: $STATUS"
+          echo "Payment Service status: $STATUS"
+          if [ "$STATUS" = "200" ]; then
+            echo "PASSED - Payment Service is healthy"
+          else
+            echo "WARNING - Service returned $STATUS"
+          fi
 
   notify-summary:
     name: "Stage 10 — Notify & Summary"
@@ -186,4 +201,5 @@ jobs:
           echo "  Branch  : ${{ github.ref_name }}"
           echo "  Author  : ${{ github.actor }}"
           echo "  Time    : $(date -u)"
+          echo "  URL     : http://${{ secrets.EC2_HOST }}/api/payments/health"
           echo "========================================"
